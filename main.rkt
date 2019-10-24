@@ -7,11 +7,24 @@
 (provide uuid-symbol?
          uuid-string?
          strict-uuid-string?
+         random-node
          (contract-out
           [uuid-symbol
            (-> symbol?)] ;; uuid-symbol?
+          [uuid-symbol/time
+           (-> symbol?)]
+          [uuid-symbol/name
+           (-> (or/c uuid-string? uuid-symbol? bytes?) (or/c string? bytes?) symbol?)]
           [uuid-string
            (-> (and/c string? immutable?))] ;; strict-uuid-string?
+          [uuid-string/time
+           (-> (and/c string? immutable?))]
+          [uuid-string/name
+           (-> (or/c uuid-string? uuid-symbol? bytes?) (or/c string? bytes?)
+               (and/c string? immutable?))]
+
+          [make-uuid-v1-generator
+           (-> bytes? (-> (and/c string? immutable?)))]
           [uuid-string->symbol
            (-> uuid-string? symbol?)] ;; uuid-symbol?
           ))
@@ -20,6 +33,10 @@
   (require rackunit
            (only-in srfi/13 string-pad)))
 
+(define (bytes-update! bs i proc)
+  (bytes-set! bs i (proc (bytes-ref bs i))))
+
+
 (define (uuid-symbol)
   (define s (string->symbol (uuid-generate*)))
   (hash-set! known-uuid-symbols s #t)
@@ -27,6 +44,35 @@
 
 (define (uuid-string)
   (string->immutable-string (uuid-generate*)))
+
+(define (uuid-string->bytes s)
+  (define response (make-bytes 16 0))
+  (define filtered (list->string (filter (λ (c) (or (char-numeric? c) (char-alphabetic? c))) (string->list s))))
+  (unless (= 32 (string-length filtered))
+    (raise-argument-error 'uuid-string->bytes "uuid-string?" s))
+  (for ([i (in-range 16)])
+    (bytes-set! response i (string->number (substring filtered (* 2 i) (* 2 (add1 i))) 16)))
+  response)
+
+(define (uuid-string/name namespace name)
+  (let* ([namespace/bytes
+          (if (bytes? namespace) namespace
+              (if (string? namespace) (uuid-string->bytes namespace)
+                  (uuid-string->bytes (symbol->string namespace))))]
+         [name/bytes 
+          (if (string? name) (string->bytes/utf-8 name) name)]
+         [message (bytes-append namespace/bytes name/bytes)]
+         [digest (sha1-bytes message)]
+         [bs (subbytes digest 0 16)])
+    (bytes-update! bs 6 byte-set-version-5)
+    (bytes-update! bs 8 byte-set-variant)
+    (string->immutable-string (uuid-bytes->string bs))))
+
+(define (uuid-symbol/name namespace name)
+  (define s (string->symbol (uuid-string/name namespace name)))
+  (hash-set! known-uuid-symbols s #t)
+  s)
+
 
 (define (uuid-string->symbol u)
   (let ([u (string->immutable-string u)])
@@ -122,6 +168,59 @@
 ;; digit first.  The hexadecimal values "a" through "f" are output as
 ;; lower case characters and are case insensitive on input.
 
+(define (uuid-node? v)
+  (and (bytes? v) (= (bytes-length 6))))
+
+(define (byte-set-random-node b)
+  (bitwise-ior b 1))
+
+(define (random-node)
+  (define bs (crypto-random-bytes 6))
+  (bytes-update! bs 0 byte-set-random-node) ; if node ID is random, the least significant bit of leading octet set to 1
+  bs)
+
+(define (make-uuid-v1-generator [node (random-node)])
+  (let ([count 0]
+        [last-time 0]
+        [sema (make-semaphore 1)])
+    (lambda ()
+      (semaphore-wait sema)
+      (let* ([cur-time (+ 122192928000000000  (round (inexact->exact (* (current-inexact-milliseconds) 10000))))]
+             [count-prime (if (= cur-time last-time) count 0)])
+        (cond [(= count-prime 16384) (semaphore-post sema) #f]
+              [else
+               (set! last-time cur-time)
+               (set! count (add1 count-prime))
+               (semaphore-post sema)
+               (let ([time-low (bitwise-and #xFFFFFFFF cur-time)]
+                     [time-med (bitwise-and #xFFFF (arithmetic-shift cur-time -32))]
+                     [time-high (bitwise-and #xFFFF (arithmetic-shift cur-time -48))]
+                     [adj-seq (bitwise-and #x3FFF count)]
+                     [bs (make-bytes 16)])
+                 (for ([i (in-range 4)])
+                   (bytes-set! bs i (bitwise-and #xFF (arithmetic-shift time-low (* -8 (- 3 i))))))
+                 (for ([i (in-range 2)])
+                   (bytes-set! bs (+ 4 i) (bitwise-and #xFF (arithmetic-shift time-med (* -8 (- 1 i))))))
+                 (for ([i (in-range 2)])
+                   (bytes-set! bs (+ 6 i) (bitwise-and #xFF (arithmetic-shift time-high (* -8 (- 1 i))))))
+                 (for ([i (in-range 2)])
+                   (bytes-set! bs (+ 8 i) (bitwise-and #xFF (arithmetic-shift adj-seq (* -8 (- 1 i))))))
+                 (for ([i (in-range 6)])
+                   (bytes-set! bs (+ 10 i) (bytes-ref node i)))
+                 (bytes-update! bs 6 byte-set-version-1)
+                 (bytes-update! bs 8 byte-set-variant)
+                 (string->immutable-string (uuid-bytes->string bs)))])))))
+
+(define uuid-string/time
+  (make-uuid-v1-generator (with-handlers ([exn:fail:filesystem? (lambda (e) (random-node))])
+                            (with-input-from-file "node.rktd" read))))
+
+(define (uuid-symbol/time)
+  (define s (string->symbol (uuid-string/time)))
+  (hash-set! known-uuid-symbols s #t)
+  s)
+
+
 (define (uuid-bytes->string [bs (crypto-random-bytes 16)])  
   (define (extract-hex start [end start])
     (bytes->hex-string (subbytes bs start (add1 end))))
@@ -182,9 +281,18 @@
 ;;                                   randomly generated version
 ;;                                   specified in this document.
 
-(define (byte-set-version-number b)
+(define (byte-set-version-4 b)
   (bitwise-ior #b01000000
                (bitwise-and #b00001111 b)))
+
+(define (byte-set-version-1 b)
+  (bitwise-ior #b00010000
+               (bitwise-and #b00001111 b)))
+
+(define (byte-set-version-5 b)
+  (bitwise-ior #b01010000
+               (bitwise-and #b00001111 b)))
+
 
 (module+ test
   (test-case
@@ -193,7 +301,7 @@
      (test-case
       (format "b = ~v" b)
       (define s (byte->binary b))
-      (define b* (byte-set-version-number b))
+      (define b* (byte-set-version-4 b))
       (define s* (byte->binary b*))
       (check-regexp-match #rx"^0100" s*)
       (check-regexp-match #rx"^4"
@@ -201,8 +309,6 @@
       (check-equal? (substring s* 4)
                     (substring s 4))))))
 
-(define (bytes-update! bs i proc)
-  (bytes-set! bs i (proc (bytes-ref bs i))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -210,7 +316,7 @@
 (define (uuid-generate*)
   (define bs
     (crypto-random-bytes 16))
-  (bytes-update! bs 6 byte-set-version-number)
+  (bytes-update! bs 6 byte-set-version-4)
   (bytes-update! bs 8 byte-set-variant)
   (uuid-bytes->string bs))
 

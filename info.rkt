@@ -13,3 +13,5 @@
                      "rackunit-lib"))
 
 (define scribblings '(("scribblings/uuid.scrbl" ())))
+
+(define post-install-collection "post-install.rkt")
