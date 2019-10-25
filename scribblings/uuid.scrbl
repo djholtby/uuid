@@ -42,12 +42,55 @@ which obtains cryptographic-quality randomness from the operating system.
  To consistently convert UUID strings to symbols,
  use @racket[uuid-string->symbol].
 
- @examples[
+  @examples[
  #:eval (make-uuid-eval)
  (uuid-symbol)
  (uuid-string)
  ]}
 
+
+@deftogether[
+ (@defproc[(uuid-symbol/name [namespace (or/c uuid-string? uuid-symbol? bytes?)] [name (or/c string? bytes?)]) uuid-symbol?]
+   @defproc[(uuid-string/name [namespace (or/c uuid-string? uuid-symbol? bytes?)] [name (or/c string? bytes?)])
+            (and/c strict-uuid-string? immutable?)])]{
+  Returns a new @tech{UUID} (Version 5) based on @tech{UUID} @racket[namespace] and text @racket[name], as a symbol or string, respectively.
+
+  Namespace can be given as a @racket[uuid-string?] or @racket[uuid-symbol?], or as a byte string.  In this case the byte string should
+  represent the bytes of a valid UUID (but this is not checked by the contract).
+                
+  @examples[
+ #:eval (make-uuid-eval)
+ (uuid-symbol/name '879f917a-4578-4f2f-8a83-c243e89f3999 "example")
+ (uuid-string/name '879f917a-4578-4f2f-8a83-c243e89f3999 "example")
+ ]}
+
+@deftogether[
+ (@defproc[(uuid-symbol/time) uuid-symbol?]
+   @defproc[(uuid-string/time)
+            (and/c strict-uuid-string? immutable?)])]{
+  Returns a new @tech{UUID} (Version 1) based on the current system time.  Note that the node is randomly generated at install time,
+                rather than using the system's MAC address.
+
+                The clock_seq value is randomly generated when the module is loaded, and incremented each time a clock adjustment is detected.
+                
+ @examples[
+ #:eval (make-uuid-eval)
+ (uuid-symbol/time)
+ (uuid-string/time)
+ ]}
+
+@defproc[(make-uuid-v1-generator [node uuid-node? (random-node)])
+         (-> (and/c strict-uuid-string? immutable?))]{
+  Returns a procedure identical to @racket[uuid-string/time], but using @racket[node] rather than the system node.
+  If the node is not the system MAC address, the multicast bit should be set to 1 to avoid colissions with an existing MAC address.
+  @examples[
+  #:eval (make-uuid-eval)
+  (let ([generator (make-uuid-v1-generator (make-bytes 6 0))])
+    (generator))]}
+
+@defproc[(random-node) uuid-node?]{Returns a randomly generator node, with the multicast bit set to 1.  Suitable for use with @racket[make-uuid-v1-generator].}
+
+@defproc[(uuid-node? [v any/c]) boolean?]{Predicate for 6 byte sequence, suitable for use as a node for a Version 1 UUID.  Equivalent to @racket[(and (bytes? v) (= 6 (bytes-length v)))]}
 
 @defproc[(strict-uuid-string? [v any/c]) boolean?]{
  Recognizes @tech{UUIDs} in canonical string form:
