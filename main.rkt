@@ -7,6 +7,7 @@
 (provide uuid-symbol?
          uuid-string?
          strict-uuid-string?
+         uuid-node?
          random-node
          (contract-out
           [uuid-symbol
@@ -24,7 +25,7 @@
                (and/c string? immutable?))]
 
           [make-uuid-v1-generator
-           (-> bytes? (-> (and/c string? immutable?)))]
+           (-> uuid-node? (-> (and/c string? immutable?)))]
           [uuid-string->symbol
            (-> uuid-string? symbol?)] ;; uuid-symbol?
           ))
@@ -44,6 +45,8 @@
 
 (define (uuid-string)
   (string->immutable-string (uuid-generate*)))
+
+
 
 (define (uuid-string->bytes s)
   (define response (make-bytes 16 0))
@@ -169,7 +172,7 @@
 ;; lower case characters and are case insensitive on input.
 
 (define (uuid-node? v)
-  (and (bytes? v) (= (bytes-length 6))))
+  (and (bytes? v) (= (bytes-length v) 6)))
 
 (define (byte-set-random-node b)
   (bitwise-ior b 1))
@@ -180,22 +183,35 @@
   bs)
 
 (define (make-uuid-v1-generator [node (random-node)])
-  (let ([count 0]
+  (let ([reso (inexact->exact
+               (ceiling (log (let loop ([v (round (inexact->exact (* (current-inexact-milliseconds) 10000)))])
+                               (let ([v1 (round (inexact->exact (* (current-inexact-milliseconds) 10000)))])
+                                 (if (= v v1) (loop v) (- v1 v)))) 2)))]
+        ;; reso = approximately how many bits are lost due to the system timer not really giving us 100ns
+        ;; count is our fake 100ns slices between the clock ticks that we actually notice.
+        [count 0]
         [last-time 0]
-        [sema (make-semaphore 1)])
+        [sema (make-semaphore 1)]
+        [clock-seq (bitwise-and #x3FFF (random 65536))])
+    (let* ([reso-max (expt 2 reso)] ; when count hits this, busy loop until the actual clock ticks
+           [reso-mask (sub1 reso-max)] ; mask count with this 
+           [clock-mask (- #xFFFFFFFF reso-mask)])
     (lambda ()
+      (let loop ()
       (semaphore-wait sema)
-      (let* ([cur-time (+ 122192928000000000  (round (inexact->exact (* (current-inexact-milliseconds) 10000))))]
+      (let* ([cur-time (+ (round (inexact->exact (* (current-inexact-milliseconds) 10000))) ;; ms -> 100ns
+                          122192928000000000)] ;; unix epoch (1 Jan 1 1970) -> UUID epoch (15 Oct 1582)
              [count-prime (if (= cur-time last-time) count 0)])
-        (cond [(= count-prime 16384) (semaphore-post sema) #f]
+        (when (< cur-time last-time)
+          (set! clock-seq (bitwise-and #x3FFF (add1 clock-seq)))) ; clock adjustment detected, update sequence
+        (cond [(= count-prime reso-max) (semaphore-post sema) (loop)]
               [else
                (set! last-time cur-time)
                (set! count (add1 count-prime))
                (semaphore-post sema)
-               (let ([time-low (bitwise-and #xFFFFFFFF cur-time)]
+               (let ([time-low (bitwise-xor (bitwise-and reso-mask count-prime) (bitwise-and clock-mask cur-time))]
                      [time-med (bitwise-and #xFFFF (arithmetic-shift cur-time -32))]
                      [time-high (bitwise-and #xFFFF (arithmetic-shift cur-time -48))]
-                     [adj-seq (bitwise-and #x3FFF count)]
                      [bs (make-bytes 16)])
                  (for ([i (in-range 4)])
                    (bytes-set! bs i (bitwise-and #xFF (arithmetic-shift time-low (* -8 (- 3 i))))))
@@ -204,12 +220,12 @@
                  (for ([i (in-range 2)])
                    (bytes-set! bs (+ 6 i) (bitwise-and #xFF (arithmetic-shift time-high (* -8 (- 1 i))))))
                  (for ([i (in-range 2)])
-                   (bytes-set! bs (+ 8 i) (bitwise-and #xFF (arithmetic-shift adj-seq (* -8 (- 1 i))))))
+                   (bytes-set! bs (+ 8 i) (bitwise-and #xFF (arithmetic-shift clock-seq (* -8 (- 1 i))))))
                  (for ([i (in-range 6)])
                    (bytes-set! bs (+ 10 i) (bytes-ref node i)))
                  (bytes-update! bs 6 byte-set-version-1)
                  (bytes-update! bs 8 byte-set-variant)
-                 (string->immutable-string (uuid-bytes->string bs)))])))))
+                 (string->immutable-string (uuid-bytes->string bs)))])))))))
 
 (define uuid-string/time
   (make-uuid-v1-generator (with-handlers ([exn:fail:filesystem? (lambda (e) (random-node))])
